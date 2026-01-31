@@ -1,0 +1,119 @@
+---
+- name: Create LAN-only firewall qube
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    lan_firewall_name: sys-lan-firewall
+    lan_firewall_template: debian-13  # uprav podle toho, co máš
+    lan_firewall_label: green
+    lan_firewall_netvm: sys-net
+
+  tasks:
+    - name: Ensure Qubes Ansible module is available (sanity check)
+      assert:
+        that:
+          - "'qubesos' is defined or true"
+        fail_msg: >
+          QubesOS Ansible modul není k dispozici. Ujisti se, že máš
+          nainstalovaný qubes-ansible v dom0.
+        success_msg: "Pokračuji s vytvářením qube."
+
+    - name: Create LAN firewall VM
+      qubesos:
+        guest: "{{ lan_firewall_name }}"
+        state: present
+        template: "{{ lan_firewall_template }}"
+        label: "{{ lan_firewall_label }}"
+        properties:
+          netvm: "{{ lan_firewall_netvm }}"
+          provides_network: true
+        #autostart: true
+        # volitelně:
+        # memory: 400
+        # maxmem: 800
+
+
+- hosts: sys-lan-firewall
+
+  vars:
+    lan_firewall_name: sys-lan-firewall
+
+  tasks:
+
+#    - name: Install nftables in sys-lan-firewall (if missing)
+#      qubesos:
+#        guest: "{{ lan_firewall_name }}"
+#        command: "sudo dnf -y install nftables || sudo apt-get -y install nftables"
+
+    - name: create qubes-firewall.d directory
+      become: yes
+      file:
+        path: /rw/config/qubes-firewall.d
+        state: directory
+       
+
+    - name: Deploy nftables LAN-only rules
+      become: yes
+      copy:
+        dest: /rw/config/qubes-firewall.d/lan-only.nft
+        mode: '0644'
+        content: |
+            table inet qubes_lan_only {
+              chain forward {
+                type filter hook forward priority 0;
+
+                # 1) Povolíme RELATED,ESTABLISHED pro cokoliv, co už je povolené
+                ct state established,related accept
+
+                # 2) LAN IPv4 – privátní rozsahy RFC1918
+                ip daddr 10.0.0.0/8 accept
+                ip daddr 172.16.0.0/12 accept
+                ip daddr 192.168.0.0/16 accept
+
+                # 3) LAN IPv6 – ULA + link-local
+                ip6 daddr fc00::/7 accept
+                ip6 daddr fe80::/10 accept
+
+                # 4) Všechno ostatní drop (žádný internet)
+                counter drop
+              }
+
+              chain input {
+                type filter hook input priority 0;
+                # na inputu standardně nic neměníme, necháme policy accept
+                accept
+              }
+
+              chain output {
+                type filter hook output priority 0;
+                # výstup z firewall qube ven – povolíme vše,
+                # omezení řešíme ve forward chain
+                accept
+              }
+            }
+
+    - name: Ensure custom nft rules are loaded on boot
+      become: yes
+      copy:
+        dest: /rw/config/rc.local
+        mode: '0755'
+        content: |
+            #!/bin/sh
+            # Load Qubes default firewall rules first
+            if command -v qubes-firewall >/dev/null 2>&1; then
+              qubes-firewall
+            fi
+
+            # Then load our LAN-only rules
+            if [ -f /rw/config/qubes-firewall.d/lan-only.nft ]; then
+              nft -f /rw/config/qubes-firewall.d/lan-only.nft
+            fi
+
+            exit 0
+
+    - name: Apply nftables rules immediately (without reboot)
+      become: yes
+      command: "sudo nft -f /rw/config/qubes-firewall.d/lan-only.nft"
+
